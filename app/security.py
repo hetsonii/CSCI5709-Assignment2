@@ -2,6 +2,15 @@
 Security utilities: password hashing, JWT issuance/verification, and the
 FastAPI dependency used to protect endpoints.
 
+Password hashing uses the bcrypt library directly rather than through
+passlib's CryptContext wrapper. passlib 1.7.4's bcrypt backend probes
+bcrypt.__about__.__version__ to detect the installed version, which
+was removed in bcrypt 4.x — this raises an AttributeError that passlib
+silently swallows, then falls through into a broken self-test path
+that fails with "password cannot be longer than 72 bytes" regardless
+of the actual password length. Calling bcrypt directly avoids this
+entire failure mode.
+
 JWT_SECRET_KEY must be set as an environment variable in production
 (Render). A hardcoded fallback is provided only so the app does not
 crash on a fresh local clone before the .env file is configured; it is
@@ -13,8 +22,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -37,16 +46,30 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 15
 REFRESH_TOKEN_EXPIRE_DAYS = 7
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# bcrypt's underlying algorithm has a hard 72-byte limit on the input.
+# This is a real constraint of the algorithm itself, not a bug, so
+# input over that length is truncated deliberately and predictably
+# here rather than raising deep inside a third-party library.
+_BCRYPT_MAX_BYTES = 72
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/v1/auth/login")
 
 
 def hash_password(plain_password: str) -> str:
-    return pwd_context.hash(plain_password)
+    password_bytes = plain_password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password_bytes, salt)
+    return hashed.decode("utf-8")
 
 
 def verify_password(plain_password: str, password_hash: str) -> bool:
-    return pwd_context.verify(plain_password, password_hash)
+    password_bytes = plain_password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
+    try:
+        return bcrypt.checkpw(password_bytes, password_hash.encode("utf-8"))
+    except ValueError:
+        # Raised if password_hash is not a well-formed bcrypt hash at all
+        # (e.g. corrupted data) rather than a credentials mismatch.
+        return False
 
 
 def create_access_token(subject: str, role: str) -> str:
